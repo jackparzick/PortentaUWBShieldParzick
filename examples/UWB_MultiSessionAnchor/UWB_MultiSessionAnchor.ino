@@ -1,62 +1,24 @@
 #include <PortentaUWBShieldParzick.h>
 
 /**
- * Multi-Session Anchor Demo (DIAGNOSTIC)
+ * Multi-Session Anchor Demo (SAFE DIAGNOSTIC)
  *
- * Adds:
- *  - prints return codes for init/start
- *  - prints session state from HAL
- *  - prints status/distance even for invalid measurements
- *  - throttles detail to avoid serial spam
+ * Key difference vs the previous diagnostic:
+ *  - DOES NOT print inside the ranging callback.
+ *  - Prints a once-per-second summary from loop().
  *
- * IMPORTANT FIX:
- *  - Treat status 0x1B (27) as a "valid" measurement status (OK_NEGATIVE_DISTANCE_REPORT).
- *    Otherwise you will see ranging notifications but never print distances.
+ * Why: printing inside the callback can block the UWB task/context and trigger
+ * sendUciCommandAndWait TIMEOUT -> uwb_bus_io_irq_wait semaphore timeouts.
  */
 
 // ---- knobs ----
-#define PRINT_DETAIL_EVERY_MS 250   // throttle detailed measurement prints
-#define PRINT_INVALID_ALWAYS  1     // print invalid measures even when throttled
-#define PRINT_PEER_ADDR       1
+#define SUMMARY_EVERY_MS     1000
+#define DETAIL_EVERY_MS      5000   // one detail snapshot occasionally (still from loop, not callback)
 
-// ---- status codes we care about (from observed behavior) ----
+// ---- status codes we observed ----
 #define ST_OK                 0x00
-#define ST_OK_NEG_DIST        0x1B   // 27 decimal: OK_NEGATIVE_DISTANCE_REPORT
-#define ST_RX_TIMEOUT         0x21   // 33 decimal: RX_TIMEOUT (often paired with dist=0xFFFF)
-
-static uint32_t gHdl1 = 0;
-static uint32_t gHdl2 = 0;
-
-static volatile uint32_t gNtf1 = 0, gNtf2 = 0;
-static volatile uint32_t gAvail1 = 0, gAvail2 = 0;
-
-static uint32_t gLastDetailMs = 0;
-
-// helper
-static void printHex2(uint8_t b) { if (b < 0x10) Serial.print("0"); Serial.print(b, HEX); }
-
-static void printPeer(const uint8_t peer[8], bool shortMode=true) {
-#if PRINT_PEER_ADDR
-  Serial.print("peer=");
-  int n = shortMode ? 2 : 8;
-  for (int i=0;i<n;i++) printHex2(peer[i]);
-  Serial.print(" ");
-#endif
-}
-
-static void printSessState(const char* name, uint32_t hdl) {
-  uint8_t st = 0xFF;
-  uwb::Status rc = UWBHAL.getSessionState(hdl, st);
-  Serial.print(name);
-  Serial.print(" state: rc="); Serial.print((int)rc);
-  Serial.print(" st="); Serial.println((int)st);
-}
-
-static void printStatus(const char* label, uwb::Status st) {
-  Serial.print(label);
-  Serial.print(" -> ");
-  Serial.println((int)st);  // 0 = SUCCESS
-}
+#define ST_OK_NEG_DIST        0x1B   // 27 decimal
+#define ST_RX_TIMEOUT         0x21   // 33 decimal
 
 static const char* statusLabel(uint8_t st) {
   switch (st) {
@@ -67,71 +29,71 @@ static const char* statusLabel(uint8_t st) {
   }
 }
 
-// Ranging callback
+// Session objects (local to setup), handles cached globally
+static uint32_t gHdl1 = 0;
+static uint32_t gHdl2 = 0;
+
+// Counters updated in callback (keep lightweight!)
+static volatile uint32_t gNtf1 = 0, gNtf2 = 0;
+static volatile uint32_t gMeas1 = 0, gMeas2 = 0;
+
+static volatile uint32_t gOk1 = 0, gOk2 = 0;          // st==0 or st==0x1B & dist valid
+static volatile uint32_t gTimeout1 = 0, gTimeout2 = 0; // st==0x21
+static volatile uint32_t gOther1 = 0, gOther2 = 0;    // anything else
+
+static volatile uint16_t gLastDist1 = 0xFFFF, gLastDist2 = 0xFFFF;
+static volatile uint8_t  gLastSt1 = 0xFF,   gLastSt2 = 0xFF;
+static volatile uint8_t  gLastSlot1 = 0xFF, gLastSlot2 = 0xFF;
+
+static volatile uint8_t  gLastPeer0_1 = 0, gLastPeer1_1 = 0;
+static volatile uint8_t  gLastPeer0_2 = 0, gLastPeer1_2 = 0;
+
+// Helper: consider 0x1B as valid measurement too
+static inline bool isOkStatus(uint8_t st) {
+  return (st == ST_OK) || (st == ST_OK_NEG_DIST);
+}
+
+// Ranging callback (NO PRINTS HERE)
 void rangingHandler(UWBRangingData &d) {
+  if (d.measureType() != (uint8_t)uwb::MeasurementType::TWO_WAY) return;
+
   const uint32_t h = d.sessionHandle();
-  const uint8_t type = d.measureType();
   const uint8_t avail = d.available();
-
-  if (h == gHdl1) { gNtf1++; gAvail1 += avail; }
-  else if (h == gHdl2) { gNtf2++; gAvail2 += avail; }
-
-  // Always show that notification happened + the key header values
-  Serial.print("NTF h=0x"); Serial.print(h, HEX);
-  Serial.print(" type="); Serial.print(type);
-  Serial.print(" avail="); Serial.println(avail);
-
-  // Only decode TWO_WAY measures in this demo
-  if (type != (uint8_t)uwb::MeasurementType::TWO_WAY) return;
-
   RangingMeasures twr = d.twoWayRangingMeasure();
 
-  // throttle detail prints
-  const bool timeToPrint = (millis() - gLastDetailMs) >= PRINT_DETAIL_EVERY_MS;
-  if (timeToPrint) gLastDetailMs = millis();
+  // attribute to sess1 or sess2
+  bool s1 = (h == gHdl1);
+  bool s2 = (h == gHdl2);
+  if (!s1 && !s2) return;
 
-  for (int j=0; j<avail; j++) {
-    // Pull these once so printing stays consistent
-    const uint8_t  st   = twr[j].status;
+  if (s1) { gNtf1++; gMeas1 += avail; }
+  else    { gNtf2++; gMeas2 += avail; }
+
+  for (int j = 0; j < avail; j++) {
+    const uint8_t st = twr[j].status;
     const uint16_t dist = twr[j].distance;
 
-    // OLD (too strict): const bool valid = (twr[j].status == 0) && (twr[j].distance != 0xFFFF);
-    // NEW: treat 0x1B as valid too (still a usable measurement)
-    const bool valid = (dist != 0xFFFF) && (st == ST_OK || st == ST_OK_NEG_DIST);
+    const bool ok = (dist != 0xFFFF) && isOkStatus(st);
 
-    // print all invalid (optional), and print valid only when timeToPrint
-    if (!valid) {
-#if PRINT_INVALID_ALWAYS
-      Serial.print("  ["); Serial.print(j); Serial.print("] ");
-      printPeer(twr[j].peer_addr, true);
+    if (s1) {
+      gLastSt1 = st; gLastDist1 = dist; gLastSlot1 = twr[j].slot_index;
+      gLastPeer0_1 = twr[j].peer_addr[0]; gLastPeer1_1 = twr[j].peer_addr[1];
 
-      Serial.print("st="); Serial.print(st);
-      Serial.print(" (0x"); Serial.print(st, HEX); Serial.print(" ");
-      Serial.print(statusLabel(st)); Serial.print(")");
+      if (ok) gOk1++;
+      else if (st == ST_RX_TIMEOUT) gTimeout1++;
+      else gOther1++;
+    } else {
+      gLastSt2 = st; gLastDist2 = dist; gLastSlot2 = twr[j].slot_index;
+      gLastPeer0_2 = twr[j].peer_addr[0]; gLastPeer1_2 = twr[j].peer_addr[1];
 
-      Serial.print(" dist="); Serial.print(dist);
-      Serial.print(" slot="); Serial.print(twr[j].slot_index);
-      Serial.print(" rssi="); Serial.print(twr[j].rssi);
-      Serial.print(" nlos="); Serial.print(twr[j].nlos);
-      Serial.println();
-#endif
-      continue;
-    }
-
-    if (timeToPrint) {
-      Serial.print("  ["); Serial.print(j); Serial.print("] ");
-      printPeer(twr[j].peer_addr, true);
-
-      Serial.print("OK dist="); Serial.print(dist);
-      Serial.print(" (st=0x"); Serial.print(st, HEX);
-      Serial.print(" "); Serial.print(statusLabel(st)); Serial.print(")");
-
-      Serial.print(" slot="); Serial.print(twr[j].slot_index);
-      Serial.print(" rssi="); Serial.print(twr[j].rssi);
-      Serial.println();
+      if (ok) gOk2++;
+      else if (st == ST_RX_TIMEOUT) gTimeout2++;
+      else gOther2++;
     }
   }
 }
+
+static void printHex2(uint8_t b) { if (b < 0x10) Serial.print("0"); Serial.print(b, HEX); }
 
 void setup() {
   Serial.begin(115200);
@@ -141,13 +103,10 @@ void setup() {
   digitalWrite(LEDR, LOW);
 #endif
 
-  Serial.println("\n=== Multi-session anchor (diagnostic) ===");
+  Serial.println("\n=== Multi-session anchor (SAFE DIAGNOSTIC) ===");
   UWB.registerRangingCallback(rangingHandler);
 
   UWB.begin();
-  Serial.println("UWB.begin done");
-
-  // NOTE: UWB.state() returns Status (0=SUCCESS) in this wrapper
   while (UWB.state() != 0) delay(10);
 
   // Session 1
@@ -159,14 +118,11 @@ void setup() {
   UWBMultiSessionAnchor session1(0x111111, anchor1Mac, tag1Mac, 10);
 
   uwb::Status st = session1.init();
-  printStatus("sess1 init", st);
+  Serial.print("sess1 init -> "); Serial.println((int)st);
   gHdl1 = session1.sessionHandle();
   Serial.print("sess1 handle=0x"); Serial.println(gHdl1, HEX);
-  printSessState("sess1 (after init)", gHdl1);
-
   st = session1.start();
-  printStatus("sess1 start", st);
-  printSessState("sess1 (after start)", gHdl1);
+  Serial.print("sess1 start -> "); Serial.println((int)st);
 
   // Session 2
   Serial.println("Starting session 2 ...");
@@ -177,14 +133,11 @@ void setup() {
   UWBMultiSessionAnchor session2(0x222222, anchor2Mac, tag2Mac, 11);
 
   st = session2.init();
-  printStatus("sess2 init", st);
+  Serial.print("sess2 init -> "); Serial.println((int)st);
   gHdl2 = session2.sessionHandle();
   Serial.print("sess2 handle=0x"); Serial.println(gHdl2, HEX);
-  printSessState("sess2 (after init)", gHdl2);
-
   st = session2.start();
-  printStatus("sess2 start", st);
-  printSessState("sess2 (after start)", gHdl2);
+  Serial.print("sess2 start -> "); Serial.println((int)st);
 
   Serial.println("Multi-session anchor ready!");
 }
@@ -194,17 +147,40 @@ void loop() {
   digitalWrite(LEDR, !digitalRead(LEDR));
 #endif
 
-  static uint32_t last = 0;
-  if (millis() - last >= 1000) {
-    last = millis();
-    Serial.print("HEALTH ntf(s1/s2)="); Serial.print(gNtf1);
-    Serial.print("/"); Serial.print(gNtf2);
-    Serial.print("  availSum(s1/s2)="); Serial.print(gAvail1);
-    Serial.print("/"); Serial.println(gAvail2);
+  static uint32_t lastSum = 0;
+  static uint32_t lastDetail = 0;
 
-    printSessState("sess1 periodic", gHdl1);
-    printSessState("sess2 periodic", gHdl2);
+  const uint32_t now = millis();
+
+  if (now - lastSum >= SUMMARY_EVERY_MS) {
+    lastSum = now;
+
+    Serial.print("SUMMARY ");
+    Serial.print("ntf(s1/s2)="); Serial.print((uint32_t)gNtf1); Serial.print("/"); Serial.print((uint32_t)gNtf2);
+    Serial.print(" meas(s1/s2)="); Serial.print((uint32_t)gMeas1); Serial.print("/"); Serial.print((uint32_t)gMeas2);
+
+    Serial.print(" ok(s1/s2)="); Serial.print((uint32_t)gOk1); Serial.print("/"); Serial.print((uint32_t)gOk2);
+    Serial.print(" to(s1/s2)="); Serial.print((uint32_t)gTimeout1); Serial.print("/"); Serial.print((uint32_t)gTimeout2);
+    Serial.print(" other(s1/s2)="); Serial.print((uint32_t)gOther1); Serial.print("/"); Serial.println((uint32_t)gOther2);
+
+    Serial.print("  last1 peer="); printHex2(gLastPeer0_1); printHex2(gLastPeer1_1);
+    Serial.print(" st=0x"); Serial.print(gLastSt1, HEX);
+    Serial.print(" "); Serial.print(statusLabel(gLastSt1));
+    Serial.print(" dist="); Serial.print(gLastDist1);
+    Serial.print(" slot="); Serial.print(gLastSlot1);
+
+    Serial.print("  last2 peer="); printHex2(gLastPeer0_2); printHex2(gLastPeer1_2);
+    Serial.print(" st=0x"); Serial.print(gLastSt2, HEX);
+    Serial.print(" "); Serial.print(statusLabel(gLastSt2));
+    Serial.print(" dist="); Serial.print(gLastDist2);
+    Serial.print(" slot="); Serial.println(gLastSlot2);
   }
 
-  delay(100);
+  // A slightly more detailed snapshot occasionally (still NO callback printing)
+  if (now - lastDetail >= DETAIL_EVERY_MS) {
+    lastDetail = now;
+    Serial.println("DETAIL: (If you start seeing TIMEOUT storms, reduce log level or stop polling UCI state.)");
+  }
+
+  delay(50);
 }
