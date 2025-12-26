@@ -1,3 +1,5 @@
+The original library is not my work (https://github.com/Truesense-it/PortentaUWBShield). This has a few modifications that might help people figure out how to fix some bugs. This is a work in progress and is meant as a reference. Please feel free to comment with suggestions.
+
 # Arduino Portenta UWB Shield Library
 
 This library provides support for the [Arduino Portenta UWB Shield](https://www.arduino.cc/pro/hardware-product-stella-uwb-shield), enabling Ultra-Wideband (UWB) communication capabilities for Arduino Portenta boards.
