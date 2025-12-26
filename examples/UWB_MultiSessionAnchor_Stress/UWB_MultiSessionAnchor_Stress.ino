@@ -1,0 +1,187 @@
+#include <PortentaUWBShieldParzick.h>
+
+// ---- Stress knobs ----
+static const uint32_t RUN_MS  = 15000;
+static const uint32_t IDLE_MS =  5000;
+static const uint32_t INIT_GAP_MS = 200;
+
+#define ENABLE_RECOVERY_RESET 1
+
+// Session 1: Anchor1 (0x1111) <-> Tag1 (0x2222), preamble 10
+static uint8_t kAnchor1Addr[] = {0x11, 0x11};
+static uint8_t kTag1Addr[]    = {0x22, 0x22};
+
+// Session 2: Anchor2 (0x3333) <-> Tag2 (0x4444), preamble 11
+static uint8_t kAnchor2Addr[] = {0x33, 0x33};
+static uint8_t kTag2Addr[]    = {0x44, 0x44};
+
+static UWBMacAddress gAnchor1Mac(UWBMacAddress::Size::SHORT, kAnchor1Addr);
+static UWBMacAddress gTag1Mac   (UWBMacAddress::Size::SHORT, kTag1Addr);
+static UWBMacAddress gAnchor2Mac(UWBMacAddress::Size::SHORT, kAnchor2Addr);
+static UWBMacAddress gTag2Mac   (UWBMacAddress::Size::SHORT, kTag2Addr);
+
+// IMPORTANT: keep these global/static so they survive across loop cycles.
+static UWBMultiSessionAnchor gSess1(0x111111, gAnchor1Mac, gTag1Mac, 10);
+static UWBMultiSessionAnchor gSess2(0x222222, gAnchor2Mac, gTag2Mac, 11);
+
+static uint32_t gHdl1 = 0;
+static uint32_t gHdl2 = 0;
+
+static volatile uint32_t gCount1 = 0;
+static volatile uint32_t gCount2 = 0;
+
+
+// ---- NEW: last valid distance observed per session (updated in callback, printed once per cycle)
+// Keeping this lightweight avoids Serial spam inside the callback.
+static volatile uint16_t gLastDist1 = 0xFFFF;
+static volatile uint16_t gLastDist2 = 0xFFFF;
+static volatile uint8_t  gLastSlot1 = 0xFF;
+static volatile uint8_t  gLastSlot2 = 0xFF;
+
+enum Phase { PH_START, PH_RUN, PH_STOP, PH_DEINIT, PH_IDLE };
+static Phase gPhase = PH_START;
+static uint32_t gPhaseT0 = 0;
+static uint32_t gCycle = 0;
+
+static void phaseSet(Phase p) { gPhase = p; gPhaseT0 = millis(); }
+
+static void recoveryReset(const char* why) {
+#if ENABLE_RECOVERY_RESET
+  Serial.print("RECOVERY reset: "); Serial.println(why);
+  (void)UWBHAL.reset();
+  delay(200);
+#endif
+}
+
+void rangingHandler(UWBRangingData &d) {
+  if (d.measureType() != (uint8_t)uwb::MeasurementType::TWO_WAY) return;
+
+  const uint32_t h = d.sessionHandle();
+
+  // ---- NEW: capture last valid distance for each session (low overhead) ----
+  // We do NOT print here to avoid timing pressure inside the notification callback.
+  RangingMeasures twr = d.twoWayRangingMeasure();
+  for (int j = 0; j < d.available(); j++) {
+    if (twr[j].status == 0 && twr[j].distance != 0xFFFF) {
+      if (h == gHdl1) { gLastDist1 = twr[j].distance; gLastSlot1 = twr[j].slot_index; }
+      else if (h == gHdl2) { gLastDist2 = twr[j].distance; gLastSlot2 = twr[j].slot_index; }
+    }
+  }
+
+  // ---- ORIGINAL behavior (kept): increment counts by number of available measurements ----
+  // if (h == gHdl1) gCount1 += d.available();
+  // else if (h == gHdl2) gCount2 += d.available();
+
+  // Same logic, just not commented:
+  if (h == gHdl1) gCount1 += d.available();
+  else if (h == gHdl2) gCount2 += d.available();
+}
+
+static bool initStart(UWBSession &s, uint32_t &outHandle, const char* name) {
+  uwb::Status st = s.init();
+  if (st != uwb::Status::SUCCESS) {
+    Serial.print(name); Serial.print(" init failed: "); Serial.println((int)st);
+    return false;
+  }
+  outHandle = s.sessionHandle();
+  Serial.print(name); Serial.print(" handle=0x"); Serial.println(outHandle, HEX);
+
+  st = s.start();
+  if (st != uwb::Status::SUCCESS) {
+    Serial.print(name); Serial.print(" start failed: "); Serial.println((int)st);
+    return false;
+  }
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+#if defined(ARDUINO_PORTENTA_C33)
+  pinMode(LEDR, OUTPUT);
+  digitalWrite(LEDR, LOW);
+#endif
+
+  Serial.println("UWB MultiSession ANCHOR STRESS starting...");
+  UWB.registerRangingCallback(rangingHandler);
+
+  UWB.begin();
+  delay(INIT_GAP_MS);
+  phaseSet(PH_START);
+}
+
+void loop() {
+#if defined(ARDUINO_PORTENTA_C33)
+  digitalWrite(LEDR, (millis() / (gPhase == PH_RUN ? 150 : 600)) % 2);
+#endif
+
+  switch (gPhase) {
+    case PH_START: {
+      Serial.print("\\n=== ANCHOR CYCLE "); Serial.print(gCycle); Serial.println(" START ===");
+      gCount1 = 0; gCount2 = 0;
+
+      
+      // NEW: reset last distance/slot markers each cycle so you can see if a session goes silent
+      gLastDist1 = 0xFFFF; gLastDist2 = 0xFFFF;
+      gLastSlot1 = 0xFF;   gLastSlot2 = 0xFF;
+bool ok1 = initStart(gSess1, gHdl1, "sess1");
+      bool ok2 = initStart(gSess2, gHdl2, "sess2");
+
+      if (!ok1 || !ok2) {
+        recoveryReset("init/start failed");
+        UWB.end(); delay(200); UWB.begin(); delay(INIT_GAP_MS);
+        phaseSet(PH_IDLE);
+        break;
+      }
+
+      phaseSet(PH_RUN);
+      break;
+    }
+
+    case PH_RUN:
+      if (millis() - gPhaseT0 >= RUN_MS) {
+        Serial.print("Cycle "); Serial.print(gCycle);
+        Serial.print(" counts: s1="); Serial.print((uint32_t)gCount1);
+        Serial.print(" s2="); Serial.println((uint32_t)gCount2);
+
+        
+        // NEW: print one distance snapshot per cycle (keeps output readable + low overhead)
+        Serial.print("  lastDist: s1=");
+        Serial.print(gLastDist1);
+        Serial.print(" (slot ");
+        Serial.print(gLastSlot1);
+        Serial.print(")  s2=");
+        Serial.print(gLastDist2);
+        Serial.print(" (slot ");
+        Serial.print(gLastSlot2);
+        Serial.println(")");
+if (gCount1 == 0 || gCount2 == 0) {
+          Serial.println("WARNING: one session produced 0 ranging notifications this cycle.");
+        }
+        phaseSet(PH_STOP);
+      }
+      break;
+
+    case PH_STOP:
+      Serial.print("sess1 stop -> "); Serial.println((int)gSess1.stop());
+      Serial.print("sess2 stop -> "); Serial.println((int)gSess2.stop());
+      phaseSet(PH_DEINIT);
+      break;
+
+    case PH_DEINIT:
+      Serial.print("sess1 deInit -> "); Serial.println((int)gSess1.deInit());
+      Serial.print("sess2 deInit -> "); Serial.println((int)gSess2.deInit());
+      gSess1.sessionHandle(0);
+      gSess2.sessionHandle(0);
+      phaseSet(PH_IDLE);
+      break;
+
+    case PH_IDLE:
+      if (millis() - gPhaseT0 >= IDLE_MS) {
+        gCycle++;
+        phaseSet(PH_START);
+      }
+      break;
+  }
+
+  delay(5);
+}

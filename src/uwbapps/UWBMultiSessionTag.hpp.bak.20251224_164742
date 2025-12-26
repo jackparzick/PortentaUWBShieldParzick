@@ -54,17 +54,7 @@ public:
 		appParams.stsConfig(uwb::StsConfig::StaticSts);
 		appParams.stsSegments(1);
 		appParams.sfdId(2);
-		// --------------------------------------------------------------------
-		// CHANGE (bug fix): preambleCodeIndex was hardcoded to 10.
-		// That breaks multi-session setups where session #2 uses a different
-		// preamble (e.g., 11) but the tag still uses 10.
-		//
-		// OLD (kept, commented):
-		// appParams.preambleCodeIndex(10);
-		//
-		// NEW: use the constructor parameter so each session can match the anchor.
-		appParams.preambleCodeIndex(preambleCode);
-		// --------------------------------------------------------------------
+		appParams.preambleCodeIndex(10);
     }      		
 };
 
