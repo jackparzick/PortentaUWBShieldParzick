@@ -41,19 +41,34 @@ void NearbySessionManager::onSessionStart(BLEDeviceEventHandler sessionStartHand
 
 void NearbySessionManager::blePeripheralDisconnectHandler(BLEDevice central)
 {
-    // central disconnected event handler
-
-    //NearbySessionManager::instance().handleStopSession(central);
-    
-   
-
-    
+    // --------------------------------------------------------------------
+    // NEW: stop + deinit BEFORE deleting the session record.
+    // This avoids leaving firmware sessions alive after we drop our bookkeeping,
+    // which is a common source of "wedged after a few cycles" failures.
+    // --------------------------------------------------------------------
+    // OLD behavior (kept, commented):
+    /*
     if (NearbySessionManager::instance().clientDisconnectionHandler)
         NearbySessionManager::instance().clientDisconnectionHandler(central);
-    
-    NearbySessionManager::instance().deleteSession(NearbySessionManager::instance().find(central).sessionID());
 
+    NearbySessionManager::instance().deleteSession(NearbySessionManager::instance().find(central).sessionID());
+    */
+
+    // Best-effort stop/deinit (bounded inside handleStopSession)
+    (void)NearbySessionManager::instance().handleStopSession(central);
+
+    // Notify user callback after teardown attempt
+    if (NearbySessionManager::instance().clientDisconnectionHandler)
+        NearbySessionManager::instance().clientDisconnectionHandler(central);
+
+    // Now delete the session record
+    NearbySession &s = NearbySessionManager::instance().find(central);
+    NearbySessionManager::instance().deleteSession(s.sessionID());
 }
+
+
+
+
 
 void NearbySessionManager::rxCharacteristicWritten(BLEDevice central, BLECharacteristic characteristic)
 {
@@ -66,6 +81,18 @@ bool NearbySessionManager::handleStopSession(BLEDevice bleDev)
     bool status = true;
     uwb::Status operation = uwb::Status::SUCCESS;
     NearbySession &nearbySession = NearbySessionManager::instance().find(bleDev);
+
+    // If we already consider it cleared, nothing to do
+    if (nearbySession.sessionState() == notCreated)
+    {
+        if (sessionStoppedHandler != nullptr)
+            sessionStoppedHandler(bleDev);
+        return true;
+    }
+
+    // --------------------------------------------------------------------
+    // OLD behavior (kept, commented):
+    /*
     SEMAPHORE_TAKE();
     delay(2000);
     while (nearbySession.sessionState() != notCreated)
@@ -73,48 +100,108 @@ bool NearbySessionManager::handleStopSession(BLEDevice bleDev)
         switch (nearbySession.sessionState())
         {
         case notStarted:
-            UWBHAL.Log_D("Deleting session: %04X", nearbySession.sessionHandle());
             nearbySession.stop();
             operation = nearbySession.deInit();
-
             if (operation == uwb::Status::SUCCESS || operation == uwb::Status::SESSION_NOT_EXIST)
-            {
                 nearbySession.sessionState(notCreated);
-                status = true;
-            }
             else
-            {
                 status = false;
-            }
-            //delay(2000);
             break;
-        case Started:
-            UWBHAL.Log_D("Stopping session: %04X", nearbySession.sessionHandle());
-            operation = nearbySession.stop();
-            UWBHAL.Log_D("Stopped session with status: %04X", operation);
 
+        case Started:
+            operation = nearbySession.stop();
             if (operation == uwb::Status::SUCCESS || operation == uwb::Status::SESSION_NOT_EXIST)
-            {
                 nearbySession.sessionState(notStarted);
-                status = true;
-            }
             else
-            {
                 status = false;
-            }
-            break;
-            
-        default:
-            UWBHAL.Log_E("Stop session wrong state: %d", nearbySession.sessionState());
-            status = false;
             break;
         }
     }
     SEMAPHORE_GIVE();
+    */
+    // --------------------------------------------------------------------
+    // NEW behavior:
+    // - bounded loop (timeout + max attempts)
+    // - no long delay while holding semaphore
+    // - break on failure instead of spinning forever
+    // --------------------------------------------------------------------
+
+    const uint32_t t0 = millis();
+    const uint32_t timeoutMs = 2000;
+    uint8_t attempts = 0;
+
+    SEMAPHORE_TAKE();
+
+    while (nearbySession.sessionState() != notCreated)
+    {
+        if ((millis() - t0) > timeoutMs) { status = false; break; }
+        if (++attempts > 8)              { status = false; break; }
+
+        switch (nearbySession.sessionState())
+        {
+        case Started:
+            UWBHAL.Log_D("Stopping session: %04X", nearbySession.sessionHandle());
+            operation = nearbySession.stop();
+            UWBHAL.Log_D("Stop rc=%d", operation);
+
+            if (operation == uwb::Status::SUCCESS || operation == uwb::Status::SESSION_NOT_EXIST)
+            {
+                nearbySession.sessionState(notStarted);
+            }
+            else
+            {
+                status = false;
+            }
+            break;
+
+        case notStarted:
+            // best-effort stop before deinit
+            (void)nearbySession.stop();
+
+            UWBHAL.Log_D("Deinit session: %04X", nearbySession.sessionHandle());
+            operation = nearbySession.deInit();
+            UWBHAL.Log_D("DeInit rc=%d", operation);
+
+            if (operation == uwb::Status::SUCCESS || operation == uwb::Status::SESSION_NOT_EXIST)
+            {
+                nearbySession.sessionState(notCreated);
+            }
+            else
+            {
+                status = false;
+            }
+            break;
+
+        default:
+            UWBHAL.Log_E("Stop session wrong state: %d", nearbySession.sessionState());
+            status = false;
+            // force exit so we don't hang forever
+            nearbySession.sessionState(notCreated);
+            break;
+        }
+
+        if (!status) break;
+    }
+
+    SEMAPHORE_GIVE();
+
+    // Recovery fallback: if stop/deinit failed, try to reset the UWB stack so the next start has a chance.
+    if (!status)
+    {
+        UWBHAL.Log_E("Stop/deinit failed; applying reset recovery");
+        (void)UWBHAL.reset();
+        nearbySession.sessionState(notCreated);
+    }
+
     if (sessionStoppedHandler != nullptr)
         sessionStoppedHandler(bleDev);
+
     return status;
 }
+
+
+
+
 
 void NearbySessionManager::handleTLV(BLEDevice bleDev, uint8_t *data)
 {
