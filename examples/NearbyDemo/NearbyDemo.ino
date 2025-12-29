@@ -1,5 +1,5 @@
 #include <ArduinoBLE.h>
-#include <PortentaUWBShield.h>
+#include <PortentaUWBShieldParzick.h>
 /**
  * Nearby Interaction with 3rd Party Devices from Apple 
  * (see https://developer.apple.com/nearby-interaction/) 
