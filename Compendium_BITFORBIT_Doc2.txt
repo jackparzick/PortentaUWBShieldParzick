@@ -1,0 +1,480 @@
+# DOCUMENT 2 — EVERYTHING COMPENDIUM (library + `.a` extraction + all findings)
+
+## 0) What this is
+This is the “full brain dump”: all actionable technical details we’ve learned so far about:
+- the Arduino wrapper library (structure, key classes, known quirks),
+- the `.a` extraction (what functions exist, what gates exist, what pins exist),
+- and how these intersect with the AoA plan and general robustness.
+
+If the AoA Bible is the “story,” this compendium is the “parts catalog + constraints.”
+
+---
+
+## 1) Artifact inventory and what each artifact actually gives you
+
+### 1.1 Arduino wrapper snapshot (combined text file)
+This includes:
+- `src/hal/*` types and HAL interface contract
+- `src/uwbapps/*` session management, ranging data wrappers, notification dispatcher
+- examples:
+  - DS-TWR controller/controlee
+  - one-to-many
+  - multi-session anchor/tag
+  - NearbyDemo (BLE handshake style flow)
+
+**Why it matters:**  
+It shows exactly what your Arduino layer can change without rebuilding the `.a`.
+
+### 1.2 deep_dive2 zip (SR150 `.a` evidence pack)
+This includes:
+- demangled nm-defined and nm-undefined lists (what the `.a` provides vs imports)
+- selected disassembly slices:
+  - bus IO init / val_get / val_set / irq_wait
+  - UCIF send/retransmit/timeout logic
+  - role/profile gate disassembly/summaries
+  - vendor TLV buffer builder disassembly
+- a `work_obj/` folder containing extracted object members (binary `.o` files)
+
+**Why it matters:**  
+It lets you say “is this feature even present?” and “is it gated?” before writing wrapper code.
+
+---
+
+## 2) Arduino wrapper: architecture map (what runs where)
+
+### 2.1 The HAL contract is your “thin waist”
+Your wrapper is structured so:
+- high-level Arduino code calls methods on a HAL interface (`uwb_hal.hpp`)
+- the precompiled `.a` implements those methods (SR150Hardware)
+
+So you can:
+- add helper functions in the wrapper freely
+- but new deep features (like device config / calibration injection) may require extending the HAL surface unless you call exported `UwbApi_*` symbols directly.
+
+### 2.2 NotificationDispatcher is the single most important chokepoint
+Right now:
+- It receives raw events and data pointers from the HAL
+- It copies a fixed struct size for ranging data (`sizeof(RangingResult)`), wraps it, and calls your callback
+- It does **not** preserve variable-length “extra payload”
+
+This affects:
+- AoA advanced extras (FoV type 0xA0)
+- any other feature relying on variable-length NTF payload
+
+### 2.3 UWBRangingData exposes only part of what exists
+- It exposes DS-TWR, TDoA, DL-TDoA accessors
+- It does not expose OWR AoA accessor
+- It does not expose extra payload bytes
+
+So “full AoA” must include expanding UWBRangingData.
+
+### 2.4 UWBSession init ordering is good for AoA
+Your session init order is:
+1) sessionInit
+2) setRangingParams
+3) setAppConfigMultiple
+4) setVendorAppConfig
+
+That’s the correct structure for AoA because AoA configs must be applied *before start*.
+
+### 2.5 UWBSessionManager quirk that will bite you later
+`addSession()` stores only base session info (session ID/type) and not the derived session instance you created.
+
+This doesn’t block AoA bring-up, but it can confuse multi-session debugging unless you treat SessionManager as “bookkeeping only” or fix it later.
+
+### 2.6 NearbySession/Manager: the phone handshake pipeline
+This is the “BLE TLV handshake” path:
+- iOS and Android initialize/configure/start/stop via TLVs
+- you can later stream AoA back to phone over BLE even if you don’t do “true NI direction” on iPhone
+
+This is an “outside-the-box” but practical system integration path.
+
+---
+
+## 3) `.a` extraction findings: what is actually possible
+
+### 3.1 Exported AoA-related functions and data (hard proof)
+From nm-defined, the `.a` includes:
+- `UwbApi_SetAppConfig`, `UwbApi_SetAppConfigMultipleParams`
+- `UwbApi_SetVendorAppConfigs`, `UwbApi_GetVendorAppConfigs`
+- `UwbApi_SetCalibration`, `UwbApi_GetCalibration`
+- `UwbApi_SetDeviceConfig`, `UwbApi_GetDeviceConfig`
+- parsing functions: `parseRangingNtf`, `parseTwoWayRangingNtf`, `parseOneWayRangingNtf`
+- AoA calibration helpers/tables:
+  - `setDefaultAoaCalibration`
+  - `aoa_config_block_names`
+  - pdoa offsets and thresholds by channel
+
+**Implication:**  
+AoA enablement, vendor knobs, and calibration are not missing at the `.a` level.
+
+### 3.2 Vendor TLV gate (the “you cannot brute force this” constraint)
+The `.a` has a strict vendor ID whitelist and size-class mapping (see AoA Bible Appendix B).
+
+This means:
+- your wrapper enums can list vendor IDs that *exist as names*, but
+- the `.a` can still reject them at runtime.
+
+So any “advanced feature” plan must begin by checking:
+- is the ID in the whitelist?
+- is it 1/2/4/varlen?
+- are we sending correct length?
+
+### 3.3 Bus/pins/IRQ are not abstract — they’re hardwired
+Disassembly confirms the `.a` uses specific pins for CS/reset/IRQ.
+
+Practical impact:
+- if you use those pins for anything else (NeoPixels, random GPIO), you can break ranging notifications and think AoA is dead.
+
+### 3.4 UCIF command engine exists (so “bounded stop” can be engineered)
+The zip includes disassembly slices for:
+- send command
+- retransmit
+- timeout
+
+Even if we don’t rewrite UCIF, this tells you:
+- there is already retry logic and timeout logic in the stack
+- your wrapper must avoid starving the command channel with too much logging / blocking
+
+### 3.5 Role/profile gate strings exist (NI flow constraints)
+The zip has “Role not supported” and “Profile ID not supported” callsite mapping info.
+This matters for:
+- iOS configure flows (profile allowlist / blob sizes)
+- Android role gating
+
+Even though this isn’t AoA-specific, it’s part of the “full system correctness” plan.
+
+---
+
+## 4) The “known gaps” list (everything blocking full functionality today)
+
+### AoA-specific blockers
+1) AoA not enabled in examples by default
+2) No AoA convenience setters in `UWBAppParamList`
+3) Vendor AoA knobs not surfaced by typed helpers (must build TLVs manually)
+4) OWR AoA blocked by:
+   - union member commented out
+   - missing accessor
+5) Advanced AoA vendor extras blocked by:
+   - NotificationDispatcher dropping extra bytes
+   - UWBRangingData not owning extra payload
+
+### Robustness/system blockers (will matter later)
+1) SessionManager stores only base session info
+2) Nearby stop loop may be slow/unbounded (needs tightening in production)
+3) No easy “GetAppConfig readback” path exposed at Arduino level (slows debugging)
+
+---
+
+## 5) Verification checklist before we write real patches
+This is the “don’t build castles on sand” checklist:
+
+### AoA bring-up verification
+- DS-TWR AoA fields become nonzero after setting:
+  - AoaResultReq (0x0D) + ResultReport (0x2E)
+- AoA changes with motion and FOM responds to LOS/NLOS
+
+### Vendor knob verification
+- IDs 0x80/0x84/0x85 are accepted (no “not supported” behavior)
+- varlen blobs:
+  - discover expected length/format via controlled experiments
+
+### Advanced extra payload verification
+- confirm extra_length becomes nonzero
+- confirm extra bytes are contiguous in callback memory (if not, plan changes)
+
+### OWR verification
+- confirm measureType==OWR_WITH_AOA can be observed at all on your firmware/profiles
+- confirm expected count=1 unless proven otherwise
+
+### Stress verification
+- 100 start/stop cycles without hang
+- peer drop mid-session does not hang stop/teardown
+
+---
+
+# END DOCUMENT 2
+
+---
+
+# ADDITIONS (as requested — appended without deleting anything)
+
+## Additions to Document 1 (AoA Bible)
+
+### A1) Evidence ledger for every **[CONFIRMED]** claim
+Purpose: when you’re mid-debug, you need **one-hop traceability**:
+**Claim → Artifact → Exact search string → Expected hit.**
+
+You can literally paste the “Exact search string” into ripgrep or your editor search.
+
+#### Evidence Ledger (starter set — expand as we validate more)
+1) **Claim:** AoAResultReq is AppConfig ID `0x0D` and length is **1 byte**  
+   - Artifact: `deep_dive2_20251229_180000/12_bus_io.strings.txt`  
+   - Search string: `UCI_PARAM_ID_AOA_RESULT_REQ`  
+   - Expected hit: `0x0D`  
+   - Search string: `UCI_PARAM_LEN_AOA_RESULT_REQ`  
+   - Expected hit: `0x01`
+
+2) **Claim:** AoABoundConfig is AppConfig ID `0x1D` and length is **8 bytes**  
+   - Artifact: `deep_dive2_20251229_180000/12_bus_io.strings.txt`  
+   - Search string: `UCI_PARAM_ID_AOA_BOUND_CONFIG`  
+   - Expected hit: `0x1D`  
+   - Search string: `UCI_PARAM_LEN_AOA_BOUND_CONFIG`  
+   - Expected hit: `0x08`
+
+3) **Claim:** ResultReportConfig is AppConfig ID `0x2E`  
+   - Artifact: `deep_dive2_20251229_180000/12_bus_io.strings.txt`  
+   - Search string: `UCI_PARAM_ID_RESULT_REPORT_CONFIG`  
+   - Expected hit: `0x2E`
+
+4) **Claim:** OWR_WITH_AOA measurement type exists and is `0x03`  
+   - Artifact: `deep_dive2_20251229_180000/12_bus_io.strings.txt`  
+   - Search string: `MEASUREMENT_TYPE_OWR_WITH_AOA`  
+   - Expected hit: `0x03`
+
+5) **Claim:** OWR AoA max count is 1 in this build  
+   - Artifact: `deep_dive2_20251229_180000/12_bus_io.strings.txt`  
+   - Search string: `MAX_NUM_OWR_AOA_MEASURES`  
+   - Expected hit: `1`
+
+6) **Claim:** FoV-specific vendor extra data type exists and is `0xA0`  
+   - Artifact: `deep_dive2_20251229_180000/12_bus_io.strings.txt`  
+   - Search string: `FOV_SPECIFIC_DATA_TYPE`  
+   - Expected hit: `0xA0`
+
+7) **Claim:** Vendor whitelist includes `0x85` as **varlen**, and includes AoA IDs  
+   - Artifact: `deep_dive2_20251229_180000/31_func_getVendorAppConfigTLVBuffer.txt`  
+   - Search string: `0x85` (or `85`) + look for a branch to a “copy varlen” path  
+   - Expected: evidence that ID 0x85 maps to a varlen TLV builder path  
+   - Also confirm:
+     - `0x80` maps to 1-byte TLV builder path
+     - `0x84` maps to 1-byte TLV builder path
+
+8) **Claim:** DS-TWR measurement struct contains AoA fields  
+   - Artifact: Arduino wrapper snapshot (`PortentaUWBShield 4A combined`)  
+   - Search string: `aoa_azimuth` within `twr_mesr` definition  
+   - Expected hit: `int16_t aoa_azimuth;` and `uint8_t aoa_azimuth_fom;` etc.
+
+9) **Claim:** OWR AoA is blocked by a commented union member in wrapper  
+   - Artifact: Arduino wrapper snapshot  
+   - Search string: `owr_aoa` in `RangingMeasurements` union  
+   - Expected hit: commented-out member line
+
+10) **Claim:** Advanced extras are dropped by dispatcher (current wrapper behavior)  
+   - Artifact: Arduino wrapper snapshot  
+   - Search string: `sizeof(uwb::RangingResult)` in NotificationDispatcher ranging path  
+   - Expected hit: log/copy uses fixed struct size and does not copy extra bytes
+
+---
+
+### A2) Units & scaling section (don’t leave it implicit)
+AoA fields are `int16_t`. That does **not** automatically mean “degrees” — you need to determine scaling.
+
+#### A2.1 Angle units hypotheses (ranked)
+- **Hypothesis H1 (centi-degrees):** raw = degrees × 100  
+  - Example: 4500 means 45.00°
+- **Hypothesis H2 (Q format):** raw is fixed-point, e.g. Q9.7 or Q8.8  
+  - Your wrapper defines multiple Q conversion macros, so fixed-point is plausible.
+- **Hypothesis H3 (degrees directly):** raw = degrees (rare if int16 is used to carry fractional degrees)
+
+#### A2.2 FOM meaning hypotheses
+- **Hypothesis F1:** 0–255 quality score (most likely for uint8)  
+- **Hypothesis F2:** 0–100 (scaled)  
+Either way: you will threshold it empirically, not by guess.
+
+#### A2.3 10-minute scaling experiment (fast truth serum)
+Setup:
+- Put controller fixed on table, define a “forward” axis.
+- Keep tag at fixed distance (2–4m), LOS.
+- Rotate the **controller** in known increments while keeping tag stationary (or rotate tag around controller).
+Record:
+- raw `aoa_azimuth` and `aoa_azimuth_fom` for ~200 samples per pose.
+
+Poses:
+- 0°, +45°, +90°, -45°, -90° (at least these).
+
+Analysis:
+- Compute mean raw value per pose.
+- Fit linear model: `raw ≈ scale * deg + offset`
+- If the fit is very linear and scale is around:
+  - ~100 → centi-deg
+  - ~128/256-ish → Q format
+- Determine sign convention: which direction corresponds to positive.
+
+Lock down:
+- One conversion function (raw → degrees)
+- One sign convention statement
+- One mounting yaw offset default
+
+---
+
+### A3) “Config readback” as Phase 0.5 (fastest truth serum)
+Many AoA “stuck at zero” issues are simply “config didn’t apply.”
+
+#### Phase 0.5 objective
+After you write:
+- AppConfig TLVs (0x0D, 0x2E, optionally 0x1D)
+- Vendor TLVs (0x80/0x84/0x85/0x03/0x74)
+…you verify they were accepted.
+
+#### What to do immediately (even before readback exists)
+- **Log return codes** for every `appConfig(...)` call and `setVendorAppConfig(...)` call.
+- Make it impossible to ignore a failure.
+
+#### True readback (ideal)
+- Implement:
+  - `GetAppConfigMultipleParams` in HAL wrapper if possible
+  - `GetVendorAppConfigs` similarly
+- If not exposed:
+  - Add a temporary debug hook that calls exported getters (even if ugly) until the HAL surface is extended.
+
+**Rule:** don’t interpret AoA numbers until Phase 0.5 proves config is actually latched.
+
+---
+
+### A4) Session/role support matrix
+This prevents mixing assumptions between modes.
+
+| Mode | Role | Expected AoA availability | Required configs | Notes |
+|---|---|---|---|---|
+| DS-TWR unicast | Controller | High (primary target) | AppConfig 0x0D + 0x2E | First bring-up path |
+| DS-TWR unicast | Controlee | Likely (may mirror) | same | Useful for sanity, not required |
+| One-to-many | Controller | High if per-peer demux correct | same | Must store AoA per peer |
+| Multi-session (2 sessions) | Anchor/controller | High but needs strict demux | per session | Great stress test |
+| NI BLE demo | Depends (iOS/Android config) | Depends on session created | same + phone flow | AoA can still be streamed over BLE |
+| OWR_WITH_AOA | controller/receiver | Possible but uncertain | OWR method + parsing | Wrapper currently blocks it |
+| Vendor extras (0xA0) | any | Possible but uncertain | enable extended NTFs + preserve bytes | Requires Phase 4 plumbing |
+
+---
+
+### A5) Validity gating spec for AoA samples
+Formalize what counts as “usable.”
+
+#### Reject conditions (initial spec)
+Reject if any of:
+- `status != 0`
+- `distance == 0xFFFF`
+- `fomAz < minFomAz`
+- `fomEl < minFomEl` (only if you use elevation)
+- `nlos == 1` (optional gate; treat as “reject by default” for stable UI)
+- `az` outside bounds if bounds enabled
+- `el` outside bounds if bounds enabled
+
+#### Accept conditions
+Accept if:
+- all required fields present and pass thresholds
+- and sample passes wrap-safe smoothing pipeline
+
+#### Reason codes (loggable)
+- `R_STATUS`
+- `R_DIST_INVALID`
+- `R_FOM_AZ`
+- `R_FOM_EL`
+- `R_NLOS`
+- `R_OOB_AZ`
+- `R_OOB_EL`
+
+#### Default starting thresholds (placeholders)
+- `minFomAz = 60` (tune)
+- `minFomEl = 60` (tune)
+- bounds: az ±90°, el ±60° (tune)
+- smoothing window: 5–9
+
+---
+
+### A6) Raw notification capture / replay plan
+This becomes essential once you touch:
+- varlen vendor blobs (0x85/0x74/0x03)
+- extra payload parsing (0xA0)
+
+#### Capture
+- Add a toggle to log:
+  - `measureType`, `no_of_measurements`, `extra_data_type`, `extra_length`
+  - raw bytes of extra payload (first N bytes)
+- Write log lines in a machine-parsable format (e.g., hex string with metadata header).
+
+#### Replay harness
+- A tiny offline script (Python or C++) that:
+  - reads captured hex payload
+  - re-runs parsing functions (your own parser) on it
+  - prints decoded AoA/PDoA and sanity checks lengths/offsets
+
+This lets you iterate parsing without reflashing hardware.
+
+---
+
+### A7) Payload-size & memory safety constraints
+When you start preserving `extra_length`, you must define hard rules.
+
+#### Max extra length
+- Choose a safe cap (e.g., 512 or 1024) initially.
+- Add counters:
+  - `extra_truncated_count`
+  - `extra_oversize_last_len`
+
+#### Oversize behavior
+- truncate to max
+- log a warning **rate-limited** (once per second)
+- keep running (don’t crash)
+
+#### Allocation policy
+Prefer:
+- fixed ring buffer or fixed per-event static buffer (if feasible)
+Over:
+- per-event malloc/free (can fragment and crash over time)
+
+---
+
+## Additions to Document 2 (Compendium)
+
+### B1) Glossary + naming map
+#### Glossary
+- **UCI**: UWB Command Interface (command/notification protocol)
+- **UCIF**: UCI interface layer (send/retry/timeout engine)
+- **TML**: transport middleware layer (SPI/IRQ transport)
+- **NTF**: notification (asynchronous message)
+- **TLV**: type-length-value
+- **STS**: scrambled timestamp sequence (security)
+- **FOM**: figure of merit (quality/confidence)
+- **PDoA**: phase difference of arrival (raw phase-based measurement)
+- **AoA**: angle of arrival (azimuth/elevation derived from PDoA/antenna geometry)
+
+#### Naming map (wrapper vs `.a` vs logs)
+- Wrapper: `AppConfigId::AoaResultReq` ↔ `.a` strings: `UCI_PARAM_ID_AOA_RESULT_REQ`
+- Wrapper: `VendorAppConfigId::AZIMUTH_FIELD_OF_VIEW` ↔ `.a` gate: varlen ID 0x85
+- Wrapper: `twr_mesr.aoa_azimuth` ↔ `.a` strings: `aoa_azimuth_FOM` etc.
+- Wrapper: `extra_data_type/extra_length` ↔ `.a` strings: `FOV_SPECIFIC_DATA_TYPE 0xA0`
+
+---
+
+### B2) Symptom → probable layer cheat sheet
+| Symptom | Most likely layer | First checks |
+|---|---|---|
+| Distance OK, AoA always 0 | Session config/report mask not applied | Phase 0.5 readback/status codes, try AoaResultReq=2, check ResultReport |
+| AoA present but frozen | Wrong measurement type/field interpretation OR stale copy | Confirm measureType, ensure callback called repeatedly, ensure per-entry loop correct |
+| AoA disappears in one-to-many | Per-peer demux/state bug | Key by (session, peer), don’t store “global last AoA” |
+| AoA noisy / jumps | Quality gating/smoothing missing | FOM threshold + wrap-safe smoothing + NLOS reject |
+| AoA mirrored/rotated | Coordinate frame mismatch | mountYawDeg definition, sign convention |
+| Vendor settings “succeed” but no effect | Wrong blob format for varlen OR wrong preset | whitelist check, length check, raw extra payload capture |
+| Stop hangs | teardown/unbounded wait path | bounded stop state machine, reduce logging, confirm no blocking in callback |
+
+---
+
+### B3) OSCEN strap uncertainty (hardware constraint)
+**[UNCERTAIN]** The note you pasted mentions that OSCEN can be “effectively not in the loop” depending on stuffing/straps on the shield schematic.
+
+Actionable way to treat this in practice:
+- Don’t assume a software change can “fix OSCEN.”
+- If you see inconsistent bring-up behavior across boards, put “OSCEN strap / stuffing options” on the hardware checklist.
+- When you provide the actual schematic/layout later, we’ll pin this down as [CONFIRMED] or remove it.
+
+---
+
+## What to test (first, before any advanced work)
+1) **Phase 0.5:** every config write returns success and/or readback matches (AppConfig + vendor).  
+2) **Angle scaling experiment:** rotate in known steps, record raw int16 + FOM, fit scale/offset/sign.  
+3) **Extra payload sanity:** log `extra_data_type/extra_length` every NTF; confirm if/when it becomes nonzero.  
+
+## What will be next
+- We implement **Phase 0 + 0.5** as the first code patch: enable configs + print all AoA fields + log success/readback.  
+- Only after AoA is “alive” do we touch Phase 3+ (vendor blobs) and Phase 4 (extra payload preservation).

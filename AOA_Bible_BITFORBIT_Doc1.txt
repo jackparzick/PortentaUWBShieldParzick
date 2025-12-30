@@ -1,0 +1,627 @@
+2025-12-30 06:49:12 AM MT —
+
+Below is everything **exactly as I typed it before** (no deletions), **plus** the additions you pasted (folded in as addenda to Document 1 and Document 2).
+
+---
+
+# DOCUMENT 1 — AOA BIBLE (SR150/DCU150 + Portenta C33 wrapper)
+
+## 0) What this is and how to read it
+This is a single place for **every AoA-related fact, constraint, and plan** derived from:
+
+- Your Arduino wrapper snapshot (`PortentaUWBShield 4A combined`)
+- Your `.a` deep-dive pack (`deep_dive2_20251229_180000.zip`)
+- Your excerpts from other chats (treat as “likely” unless directly validated here)
+
+I tag statements by confidence:
+
+- **[CONFIRMED]**: directly supported by the uploaded wrapper snapshot and/or deep-dive zip (nm/strings/disasm)
+- **[LIKELY]**: strongly implied and consistent with evidence, but needs runtime confirmation
+- **[UNCERTAIN]**: depends on firmware behavior, blob formats, or missing disasm/type layout
+
+The goal: make sure every code change we do later is either:
+1) **provably supported by the `.a`**, or  
+2) **explicitly an experiment**, with a clean test/rollback.
+
+---
+
+## 1) What “full AoA” means in this system
+AoA functionality breaks into **four tiers** that map cleanly onto your codebase:
+
+### Tier A — AoA appears in results
+You get AoA numbers **inside ranging notifications** and can access them in Arduino code.
+
+- For DS-TWR (two-way), your wrapper struct already has AoA fields.
+- For OWR_WITH_AOA (one-way with AoA), your wrapper has types but currently blocks access (union member commented out).
+
+### Tier B — AoA is controllable (configs)
+You can explicitly control:
+- whether AoA is emitted at all,
+- whether azimuth only / elevation only,
+- whether AoA fields appear in the report payload,
+- whether AoA is bounded/gated by a field-of-view (FoV) concept.
+
+This is split across:
+- **Session AppConfig TLVs** (FiRa/UCI “app config”)  
+- **Vendor/Extended TLVs** (NXP vendor knobs) with a strict whitelist gate in the `.a`
+
+### Tier C — AoA is “good” (stable and usable)
+You add:
+- FOM gating
+- wrap-safe smoothing
+- per-peer state (so one-to-many doesn’t scramble angles)
+- a coordinate frame definition + mounting correction
+
+### Tier D — AoA is “advanced” (debug + calibration + multi-session + robustness)
+You unlock:
+- vendor “extra” payloads: per-antenna-pair AoA/PDoA, FoV flags, SNR/path index
+- host-side calibration (always doable)
+- optional device-side calibration injection (possible but format-dependent)
+- robust stop/start and multi-session coexistence
+
+---
+
+## 2) Hardware reality: SR150 vs DCU150 and what AoA you should expect
+### 2.1 What we can safely assume
+- **[CONFIRMED]** Your stack is SR150-based (“SR150Hardware” appears in `.a` nm-defined).
+- **[CONFIRMED]** Portenta UWB Shield uses the DCU150 module (your files and previous checks support this; treat as design assumption for your setup).
+- **[LIKELY]** DCU150 is optimized for **2D AoA** (azimuth) with an embedded antenna arrangement; expect azimuth to be the most meaningful signal initially.
+
+### 2.2 Practical consequence for implementation strategy
+- Treat **azimuth** as the primary “ship” metric.
+- Treat elevation as:
+  - possibly present (fields exist), but
+  - not guaranteed meaningful until proven with tests.
+- “3D AoA” vendor knobs can be:
+  - accepted by the `.a`,
+  - but ineffective on DCU150 hardware (or not supported by the module’s antenna topology).
+
+So we build:
+1) DS-TWR azimuth first,
+2) then elevation if it behaves,
+3) then “advanced extras” and vendor knobs.
+
+---
+
+## 3) AoA data model in *your Arduino wrapper* (what already exists)
+This is crucial: **AoA is already in your struct model.** The biggest immediate problem is that your *examples* don’t turn it on or print it.
+
+### 3.1 DS-TWR measurements already carry AoA + FOM (Tier A is possible without OWR)
+**[CONFIRMED]** In `twr_mesr` you already have (names as they appear in your wrapper snapshot):
+
+- `aoa_azimuth` (int16)
+- `aoa_azimuth_fom` (uint8)
+- `aoa_elevation` (int16)
+- `aoa_elevation_fom` (uint8)
+- destination variants:
+  - `aoa_dest_azimuth`, `aoa_dest_azimuth_fom`
+  - `aoa_dest_elevation`, `aoa_dest_elevation_fom`
+
+Plus:
+- `status`, `nlos`, `rssi`, `distance`, `slot_index`, peer address.
+
+**Implication:**  
+Even if you never implement OWR_WITH_AOA, you can still get AoA from DS-TWR results as soon as the firmware is configured to emit it.
+
+### 3.2 OWR_WITH_AOA exists conceptually, but your wrapper blocks it structurally
+**[CONFIRMED]** Your wrapper defines:
+- `MeasurementType::OWR_WITH_AOA`
+- `owr_aoa_mesr` struct
+
+But **[CONFIRMED]** your union `RangingMeasurements` has the OWR member commented out, so the data cannot be stored/accessed.
+
+Also **[CONFIRMED]** `UWBRangingData` does not provide an accessor like `owrAoaMeasure()`.
+
+So OWR AoA is a Tier D goal (after DS-TWR AoA is proven).
+
+### 3.3 “Advanced AoA” vendor extras are modeled but cannot be surfaced yet
+**[CONFIRMED]** You define rich vendor-specific structures like:
+- `extraAoaPdoaMesr` (angleOfArrival + pdoa + pdoaIndex + FoV flag)
+- `extraTwoWayRangingData` / `extraOneWayRangingData`
+- SNR/path index metadata, etc.
+
+**But**:
+- **[CONFIRMED]** `RangingResult` only contains `extra_data_type` and `extra_length`, not the bytes.
+- **[CONFIRMED]** your `NotificationDispatcher` copies only `sizeof(RangingResult)` and drops everything else.
+
+So:
+- Tier D “advanced extras” require **changing the dispatcher + UWBRangingData to preserve variable-length extra bytes**.
+
+---
+
+## 4) AoA configuration model (how AoA output is actually enabled)
+AoA output is controlled by:
+
+1) **Session AppConfig TLVs** (FiRa/UCI) — per session
+2) **Vendor/Extended TLVs** — per session, strict whitelist gate
+3) Optionally, **DeviceConfig** — global device-level config (extended NTF enable / calibration tables)
+
+### 4.1 Session AppConfig (FiRa/UCI “app config”)
+**[CONFIRMED]** Your wrapper defines:
+- `AoaResultReq = 0x0D`
+- `AoaBoundConfig = 0x1D`
+- `ResultReport = 0x2E`
+
+**[CONFIRMED]** The `.a` deep-dive zip contains strings that confirm:
+- `UCI_PARAM_ID_AOA_RESULT_REQ 0x0D`
+- `UCI_PARAM_LEN_AOA_RESULT_REQ 0x01`  → AoAResultReq is 1 byte
+- `UCI_PARAM_ID_AOA_BOUND_CONFIG 0x1D`
+- `UCI_PARAM_LEN_AOA_BOUND_CONFIG 0x08` → AoABoundConfig is 8 bytes
+- `UCI_PARAM_ID_RESULT_REPORT_CONFIG 0x2E`
+
+**What this means:**
+- `AoaResultReq` is an on/off + mode selector (1 byte).
+- `AoaBoundConfig` is an 8-byte blob (format TBD).
+- `ResultReport` is a “report composition” mask (exact bits TBD but strongly implied).
+
+#### 4.1.1 AoAResultReq value semantics
+**[LIKELY]** (from your excerpts and standard UCI stacks; verify by behavior):
+- `0x00`: disable AoA
+- `0x01`: enable AoA
+- `0x02`: enable azimuth only
+- `0x03`: enable elevation only
+- `0xF0`: enable “interleaved” AoA sampling mode
+
+#### 4.1.2 ResultReport bitmask semantics
+**[LIKELY]** (from your excerpts; verify by behavior):
+- bit0: ToF/distance
+- bit1: AoA azimuth
+- bit2: AoA elevation
+- bit3: AoA FOM
+So `0x0F` would enable all.
+
+**Practical bring-up rule:**  
+Treat `(AoaResultReq=1, ResultReport=0x0F)` as the first attempt. If AoA is still zero, change **one knob at a time**, and log exactly what changes.
+
+---
+
+### 4.2 Vendor/Extended AppConfig (NXP vendor TLVs)
+This is where “FoV”, “swap antenna pair”, and “antenna scan config” live.
+
+**[CONFIRMED]** Your wrapper defines AoA-related vendor IDs:
+- `0x80 SWAP_ANTENNA_PAIR_3D_AOA`
+- `0x84 FOV_ENABLE`
+- `0x85 AZIMUTH_FIELD_OF_VIEW`
+
+And antenna topology knobs:
+- `0x03 ANTENNAE_CONFIGURATION_RX`
+- `0x74 ANTENNAE_SCAN_CONFIGURATION`
+
+#### 4.2.1 The vendor whitelist gate is real and *hard*
+**[CONFIRMED]** Your `.a` deep-dive work shows `getVendorAppConfigTLVBuffer` uses a jump table gate. Only a strict set of IDs is accepted, grouped by value size class.
+
+**Supported vendor IDs (33 total) and size classes**  
+**[CONFIRMED]** by deep-dive notes:
+
+- **1-byte values**:  
+  `00 20 21 30 31 61 62 63 64 65 66 67 68 69 6E 70 71 72 75 7B 7F 80 82 83 84`
+- **2-byte values**:  
+  `60 6F 81`
+- **4-byte values**:  
+  `40`
+- **variable-length values**:  
+  `02 03 74 85`
+
+So for AoA:
+- `0x80` is 1-byte (supported)
+- `0x84` is 1-byte (supported)
+- `0x85` is varlen (supported)
+- `0x03` and `0x74` are varlen (supported)
+
+**Implication:**  
+If you try to use any vendor ID outside this set, the `.a` will reject it.
+
+#### 4.2.2 Vendor payload wire format
+**[LIKELY]** (from your earlier disasm-derived excerpts; not fully re-proven by deep_dive2):
+- payload starts with sessionId (LE32), then count (u8), then TLVs of `[id,len,value]`
+
+This matters when you implement “raw vendor config” debugging or bypass high-level wrappers.
+
+---
+
+### 4.3 DeviceConfig hooks (global)
+**[CONFIRMED]** Your wrapper defines device config IDs that are strongly AoA-related:
+- `NXP_EXTENDED_NTF_CONFIG 0xE433`
+- `PDOA_CALIB_TABLE_DEFINE 0xE446`
+- `ANTENNAE_RX_PAIR_DEFINE 0xE462`
+- `HOST_MAX_UCI_PAYLOAD_LENGTH 0xE431`
+
+**Interpretation:**
+- You likely can enable “extended notifications” that carry vendor extra AoA/PDoA data.
+- You may be able to define calibration tables and antenna pair geometry.
+
+**But:**
+- **[UNCERTAIN]** Your current Arduino HAL surface may not expose `setDeviceConfig()` / `setCalibration()` even though `.a` exports `UwbApi_SetDeviceConfig` and `UwbApi_SetCalibration`. That’s implementable, but it’s a Phase 6+ effort.
+
+---
+
+## 5) What the `.a` confirms about AoA (strongest binary evidence)
+From deep-dive nm-defined + strings, we can prove:
+
+### 5.1 AoA calibration assets exist in the `.a` (AoA is not a placeholder)
+**[CONFIRMED]** nm-defined contains:
+- `setDefaultAoaCalibration`
+- `aoa_config_block_names`
+- `printDistance_Aoa`
+- channel-specific calibration tables:
+  - `phNxpUciHal_pdoa_offset_calib_ch_5/_ch_9`
+  - `phNxpUciHal_aoa_threshold_pdoa_calib_ch_5/_ch_9`
+  - `phNxpUciHal_rx_pair_1_ch_5/_ch_9_pdoa_calib`
+
+This is “hard proof” the `.a` contains AoA-specific logic and calibration data.
+
+### 5.2 OWR_WITH_AOA exists and is likely limited to 1 measure
+**[CONFIRMED]** strings include:
+- `MEASUREMENT_TYPE_OWR_WITH_AOA 0x03`
+- `MAX_NUM_OWR_AOA_MEASURES 1`
+
+So if you implement OWR, expect **1** entry unless proven otherwise.
+
+### 5.3 The `.a` knows about FoV-specific data type `0xA0`
+**[CONFIRMED]** strings include:
+- `FOV_SPECIFIC_DATA_TYPE 0xA0`
+
+So your “advanced extras” plan is plausible: the binary explicitly references this concept.
+
+---
+
+## 6) The real end-to-end AoA data path (what must be correct)
+This is the critical mental model for debugging:
+
+1) SR150 firmware emits UCI notifications (range data NTF)
+2) `.a` parses them (`parseRangingNtf` → `parseTwoWayRangingNtf` / `parseOneWayRangingNtf`)
+3) `.a` produces a `RangingResult` object (plus optional appended extra bytes)
+4) Arduino wrapper receives a callback to NotificationDispatcher
+5) NotificationDispatcher copies data into `uwb::RangingResult` and wraps into `UWBRangingData`
+6) Your sketch callback reads `UWBRangingData.twoWayRangingMeasure()` and prints fields
+
+**Current blockers:**
+- DS-TWR AoA is blocked only by **config not set + not printed**
+- Advanced extras are blocked by NotificationDispatcher dropping bytes
+- OWR AoA is blocked by wrapper union/accessor
+
+So the “bring-up ladder” is straightforward.
+
+---
+
+# 7) THE PHASES — extremely detailed execution plan
+
+## Phase 0 — AoA appears in DS-TWR (high confidence, minimal risk)
+### Objective
+Prove AoA fields in `twr_mesr` are non-zero and respond to motion.
+
+### Exact recipe (do not improvise)
+**Step P0.0 — Ensure you’re seeing distance first**
+If distance doesn’t work, do not touch AoA. AoA debugging is pointless if ToF is invalid.
+
+**Step P0.1 — Add AoA config writes between `init()` and `start()`**
+Your wrapper already supports:
+- `enableRangingDataNtf(1)`
+- `appConfig(AppConfigId, value)`
+So do:
+
+- `init()`
+- `enableRangingDataNtf(1)`
+- `appConfig(AoaResultReq, 1)`
+- `appConfig(ResultReport, 0x0F)`
+- `start()`
+
+**Step P0.2 — Print ALL AoA fields for each valid responder**
+For each `twr_mesr` element where `status==0` and `distance!=0xFFFF`:
+print:
+- distance
+- rssi
+- nlos
+- az raw + azFOM
+- el raw + elFOM
+- dest az raw + dest azFOM
+- dest el raw + dest elFOM
+
+**Step P0.3 — Create a “config matrix test” (fast triage)**
+If AoA stays zero, don’t guess forever. Run this matrix:
+
+- AoaResultReq = 1, ResultReport = 0x0F
+- AoaResultReq = 2, ResultReport = 0x0F  (az only)
+- AoaResultReq = 3, ResultReport = 0x0F  (el only)
+- AoaResultReq = 1, ResultReport = 0x03  (ToF+az only)  [LIKELY bits]
+- AoaResultReq = 1, ResultReport = 0x05  (ToF+el only)  [LIKELY bits]
+- AoaResultReq = 0xF0, ResultReport = 0x0F (interleaved mode)  [LIKELY]
+
+You log:
+- what you set,
+- return statuses,
+- and whether AoA changed.
+
+**Step P0.4 — Validate with a deterministic motion test**
+- Place the controlee ~2–4 m away, LOS.
+- Move slowly left/right across the controller’s forward axis.
+Expected:
+- az changes sign/direction consistently
+- azFOM rises in LOS and is lower in NLOS
+- elevation may be noisy or near-constant initially (hardware dependent)
+
+### Acceptance criteria
+Phase 0 is “done” if:
+- At least one of the AoA fields (preferably azimuth) is non-zero and changes with motion in a stable direction.
+
+### Failure modes and what they mean
+- **AoA fields always zero**:
+  - config not actually applied,
+  - wrong ResultReport bits,
+  - AoA not supported for that session type/channel,
+  - antenna config suppressing AoA.
+- **AoA fields nonzero but frozen**:
+  - wrong field interpretation (reading wrong measure type),
+  - firmware emitting but always “invalid quality” (FOM constant low),
+  - far/NLOS environment.
+
+---
+
+## Phase 1 — Add AoA convenience API (so you stop writing magic IDs in sketches)
+### Objective
+AoA becomes a first-class feature of the library API, not “demo code hacks.”
+
+### Deliverables
+1) `UWBAppParamList` convenience methods:
+- `aoaResultReq(uint32_t req)`
+- `resultReport(uint32_t mask)`
+- `aoaBoundConfig(const uint8_t* eightBytes)`
+
+2) `AoaResultReqType` enum (or similar) for readable code:
+- OFF / ON / AZ_ONLY / EL_ONLY / INTERLEAVED
+
+3) A “log AoA raw” helper that prints:
+- raw int16 values
+- plus one or two plausible fixed-point interpretations (until you confirm scaling)
+
+### Why this matters
+Once you move to multi-session/multi-peer and NI integration, you *must* be able to apply AoA config in a repeatable and auditable way.
+
+---
+
+## Phase 2 — Make AoA usable (quality gating + smoothing + coordinate frame)
+### Objective
+Stop treating AoA as a raw sensor. Convert it into a stable signal your application can use.
+
+### 2.1 Define “AoA policy”
+Minimum fields:
+- `minFomAz`, `minFomEl`
+- `rejectIfNlos`
+- `boundsEnabled` and bounds:
+  - `azMin, azMax`
+  - `elMin, elMax`
+- `smoothingWindow`
+- `mountYawDeg` (start yaw-only)
+
+### 2.2 Implement per-peer state
+Key it by:
+- `session_handle`
+- peer short address (first 2 bytes of peer_addr if using short addresses)
+
+Store:
+- rolling window of accepted az/el (and optionally raw + corrected)
+- accepted/rejected counters by reason (status vs FOM vs NLOS vs bounds)
+- jitter estimate (stddev) for diagnostics
+
+### 2.3 Implement wrap-safe smoothing (critical)
+Never average angles directly across ±180.
+Do:
+- θ → (cosθ, sinθ)
+- average vectors
+- θ = atan2(avgSin, avgCos)
+
+Do this for azimuth (and optionally elevation if you later treat it as circular).
+
+### 2.4 Coordinate frame definition (prevents “fake bugs”)
+Define:
+- what “0° azimuth” means on the physical board orientation
+- what sign means (left positive vs right positive)
+
+Implement `mountYawDeg`:
+- `az_corrected = wrap(az_raw + mountYawDeg)`
+
+Only after yaw is stable do you consider full 3D rotations or IMU fusion.
+
+---
+
+## Phase 3 — Vendor AoA knobs + presets (FOV + antenna config + scan/swap)
+### Objective
+Use the `.a`-permitted vendor knobs to improve AoA stability and interpretability.
+
+### 3.1 Add typed vendor setters in `UWBVendorParamList`
+Implement methods that enforce:
+- correct ID,
+- correct value length based on whitelist size class.
+
+Required methods:
+- `setFovEnable(uint8_t v)` (0/1)
+- `setSwapAntennaPair3dAoa(uint8_t v)` (0/1 or mode)
+- `setAzimuthFieldOfView(const uint8_t* blob, uint8_t len)` (varlen)
+- `setRxAntennaConfig(const uint8_t* blob, uint8_t len)` (0x03 varlen)
+- `setAntennaScanConfig(const uint8_t* blob, uint8_t len)` (0x74 varlen)
+
+### 3.2 Add “AoA preset bundles”
+Expose one call that sets a coherent set of knobs:
+- `AoAPreset::Basic2D`:
+  - AoaResultReq + ResultReport only
+- `AoAPreset::FovGated`:
+  - Basic2D + vendor FOV enable + azimuth FoV blob
+- `AoAPreset::ScanOrSwapExperimental`:
+  - Basic2D + scan config / swap pair toggles
+
+### 3.3 Handle uncertainty: varlen blob formats
+For varlen IDs (`0x85`, `0x03`, `0x74`) you must:
+- begin with minimal “known-good” values
+- add a raw dump mode
+- iterate based on observed changes
+
+You do *not* assume the blob format until you see:
+- config accepted, AND
+- behavior changes, AND
+- you can correlate raw vendor extra payload type 0xA0 (Phase 4).
+
+---
+
+## Phase 4 — Preserve and parse vendor extra payloads (advanced AoA/PDoA)
+### Objective
+Unlock “true advanced AoA”: per-antenna-pair PDoA, AoA FoV flags, etc.
+
+### Why this is blocked today
+Your dispatcher currently copies only fixed bytes and throws away anything described by:
+- `extra_data_type`
+- `extra_length`
+
+So you must change:
+- NotificationDispatcher
+- UWBRangingData
+
+### 4.1 Modify NotificationDispatcher to preserve extra bytes
+New behavior for RANGING_DATA:
+- copy fixed `RangingResult`
+- if `extra_length > 0`:
+  - copy the bytes directly after the struct into an owned buffer (bounded)
+
+**Hard safety rules:**
+- Always cap `extra_length` to a max (e.g., 512 or 1024)
+- If `extra_length` > max, truncate and log that you truncated (so you don’t OOM)
+
+### 4.2 Extend UWBRangingData to store/expose extras
+Add:
+- `extraDataType()`
+- `extraLength()`
+- `extraBytes()`
+
+Then add typed parsers:
+- if type==0xA0 → parse FoV-specific payload first
+
+### 4.3 Add raw hex dump mode
+Before you parse anything, be able to print:
+- first 64 bytes hex
+- total length
+- type
+- and a summary of “counts” if you can infer them.
+
+This is how you confirm:
+- contiguity assumptions
+- endianness
+- struct packing
+- offset correctness
+
+---
+
+## Phase 5 — Implement OWR_WITH_AOA properly
+### Objective
+Enable the one-way AoA measurement type end-to-end.
+
+### 5.1 Fix wrapper union and accessor
+- Uncomment/add `owr_aoa` in `RangingMeasurements`
+- Add `UWBRangingData::owrAoaMeasure()`
+
+### 5.2 Align expectations to `.a` limit
+`.a` strings indicate:
+- `MAX_NUM_OWR_AOA_MEASURES = 1`
+
+So:
+- treat OWR count as 1 unless proven otherwise
+- don’t hardcode 8 measures in logic even if your wrapper constant currently says 8
+
+---
+
+## Phase 6 — Calibration (host-side first, device-side later)
+### 6A Host-side calibration (always doable)
+- 0° bias calibration per channel
+- piecewise mapping measured→true
+- persist calibration by channel + antenna preset
+
+### 6B Device-side calibration injection (possible but format-dependent)
+`.a` exports:
+- `UwbApi_SetCalibration`, `UwbApi_GetCalibration`
+- `UwbApi_SetDeviceConfig`, `UwbApi_GetDeviceConfig`
+
+But you must decode:
+- payload formats for PDoA calibration tables
+- antenna pair definitions
+
+So device-side calibration is:
+- Phase 6 only after you have stable DS-TWR AoA and/or vendor extras, so you know what you’re improving.
+
+---
+
+## Phase 7 — Production-grade AoA
+This is what makes AoA “real” in your system:
+- multi-session + multi-peer correctness
+- bounded stop/start
+- NI coexistence (phone flow) without hangs
+
+Key deliverables:
+- strict demux by session + peer
+- bounded stop state machine
+- stress tests (100–1000 start/stop cycles)
+- optional BLE streaming of AoA to iPhone UI
+
+---
+
+## 8) The AoA debugging playbook (battle-tested style)
+### If AoA = 0 always, but distance works
+1) Confirm you set AoA configs **before** start
+2) Use the config matrix (change only one thing at a time)
+3) Try az-only mode (AoaResultReq=2)
+4) Try alternate channel/preamble
+5) Verify `aoaSupport` capability if available
+6) Check whether your default RX antenna config blob could be suppressing AoA
+
+### If AoA is noisy
+- gate by FOM
+- gate by NLOS
+- use wrap-safe smoothing
+- add bounds
+- verify coordinate frame (mount yaw)
+
+### If AoA seems mirrored/rotated
+- fix coordinate frame first, don’t “flip signs” randomly
+- document a single mounting offset
+
+---
+
+## 9) Appendices (AoA constants you should treat as your “truth table”)
+
+### Appendix A — confirmed AoA strings from the `.a` deep-dive (high value)
+From `12_bus_io.strings.txt` we have:
+- `UCI_PARAM_ID_AOA_RESULT_REQ 0x0D`
+- `UCI_PARAM_LEN_AOA_RESULT_REQ 0x01`
+- `UCI_PARAM_ID_AOA_BOUND_CONFIG 0x1D`
+- `UCI_PARAM_LEN_AOA_BOUND_CONFIG 0x08`
+- `UCI_PARAM_ID_RESULT_REPORT_CONFIG 0x2E`
+- `MEASUREMENT_TYPE_OWR_WITH_AOA 0x03`
+- `MAX_NUM_OWR_AOA_MEASURES 1`
+- `FOV_SPECIFIC_DATA_TYPE 0xA0`
+- `UWB_BOARD_RX_ANTENNA_CONFIG_MODE_2DAOA 2`
+- `UWB_BOARD_RX_ANTENNA_CONFIG_MODE_3DAOA 3`
+
+### Appendix B — vendor whitelist gate (you should hardcode this as a guard)
+Supported vendor IDs and size class:
+- 1-byte: `00 20 21 30 31 61 62 63 64 65 66 67 68 69 6E 70 71 72 75 7B 7F 80 82 83 84`
+- 2-byte: `60 6F 81`
+- 4-byte: `40`
+- varlen: `02 03 74 85`
+
+This is why:
+- 0x80/0x84/0x85 are worth investing in (they’re allowed)
+- other vendor IDs in your enum may exist in headers but be rejected by the `.a`
+
+### Appendix C — bus/pin reality (relevant when AoA seems “dead” due to missing NTFs)
+From disassembly of `uwb_bus_io_init`:
+- `pinMode(48, OUTPUT)`, `digitalWrite(48, HIGH)` (CS high)
+- `pinMode(30, OUTPUT)`, `digitalWrite(30, LOW)` (reset-like pulse)
+- `pinMode(29, OUTPUT)`, `digitalWrite(29, HIGH)`
+- `pinMode(31, OUTPUT)`, `digitalWrite(31, HIGH)`
+- `pinMode(28, INPUT)` (IRQ)
+- `pinMode(27, OUTPUT)` (aux)
+
+If you repurpose these pins in user sketches, you can break everything upstream of AoA.
+
+---
+
+# END DOCUMENT 1
+
+---
